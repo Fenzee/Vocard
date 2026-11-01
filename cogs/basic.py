@@ -97,8 +97,22 @@ class Basic(commands.Cog):
 
             return [app_commands.Choice(name=truncate_string(f"🎵 [{track.formatted_length}] {track.author} - {track.title}", 100), value=track.uri) for track in tracks]
         
-        history = {track["identifier"]: track for track_id in reversed(await MongoDBHandler.get_user(interaction.user.id, d_type="history")) if (track := voicelink.Track.decode(track_id))["uri"]}
-        return [app_commands.Choice(name=truncate_string(f"🕒 [{format_ms(track['length'])}] {track['author']} - {track['title']}", 100), value=track['uri']) for track in history.values() if len(track['uri']) <= 100][:25]
+        history = {}
+        for track_id in reversed(await MongoDBHandler.get_user(interaction.user.id, d_type="history")):
+            try:
+                track = voicelink.Track.decode(track_id)
+                if track and track.get("uri"):
+                    history[track["identifier"]] = track
+            except Exception:
+                continue
+        choices = [app_commands.Choice(name=truncate_string(f"🕒 [{format_ms(track['length'])}] {track['author']} - {track['title']}", 100), value=track['uri']) for track in history.values() if len(track['uri']) <= 100][:12]
+        if len(choices) < 25:
+            from voicelink.smart_autoplay import ERA_POOLS
+            for song in ERA_POOLS["indo_modern"][:8] + ERA_POOLS["global_modern"][:7]:
+                if len(choices) >= 25:
+                    break
+                choices.append(app_commands.Choice(name=truncate_string(f"🔥 {song}", 100), value=song))
+        return choices
             
     @commands.hybrid_command(name="connect", aliases=get_aliases("connect"))
     @app_commands.describe(channel="Provide a channel to connect.")
@@ -132,28 +146,33 @@ class Basic(commands.Cog):
         if not player.is_user_join(ctx.author):
             return await send_localized_message(ctx, "voice.connection.notInChannel", ctx.author.mention, player.channel.mention, ephemeral=True)
 
-        if ctx.interaction:
+        if ctx.interaction and not ctx.interaction.response.is_done():
             await ctx.interaction.response.defer()
 
         tracks = await player.get_tracks(query, requester=ctx.author)
         if not tracks:
             return await send_localized_message(ctx, "player.errors.noTrackFound")
 
+        was_playing = player.is_playing
         try:
             if isinstance(tracks, voicelink.Playlist):
                 index = await player.add_track(tracks.tracks, start_time=format_to_ms(start), end_time=format_to_ms(end))
+                if not player.is_playing:
+                    await player.do_next()
                 await send_localized_message(ctx, "player.playback.playlistLoad", tracks.name, index)
             else:
                 position = await player.add_track(tracks[0], start_time=format_to_ms(start), end_time=format_to_ms(end))
+                if not player.is_playing:
+                    await player.do_next()
                 texts = await LangHandler.get_lang(ctx.guild.id, "common.status.live", "player.playback.trackLoadPos", "player.playback.trackLoad")
                 stream_content = f"`{texts[0]}`" if tracks[0].is_stream else ""
-                additional_content = texts[1] if position >= 1 and player.is_playing else texts[2]
+                additional_content = texts[1] if position >= 1 and was_playing else texts[2]
 
                 await dispatch_message(
                     ctx,
                     stream_content + additional_content,
                     tracks[0].title, tracks[0].uri, tracks[0].author, tracks[0].formatted_length,
-                    position if position >= 1 and player.is_playing else None
+                    position if position >= 1 and was_playing else None
                 )
         finally:
             if not player.is_playing:
@@ -807,7 +826,7 @@ class Basic(commands.Cog):
             if not lyrics:
                 return await send_localized_message(ctx, "lyrics.notFound", ephemeral=True)
             
-            view = LyricsView(name=title, source={_: re.findall(r'.*\n(?:.*\n){,22}', v or "") for _, v in lyrics.items()}, author=ctx.author)
+            view = LyricsView(name=title, source={_: re.findall(r'.*\n(?:.*\n){,22}', (v or "") + "\n") for _, v in lyrics.items()}, author=ctx.author)
             view.response = await dispatch_message(ctx, await view.build_embed(), view=view)
 
     @commands.hybrid_command(name="swapdj", aliases=get_aliases("swapdj"))
@@ -847,10 +866,13 @@ class Basic(commands.Cog):
 
         check = not player.settings.get("autoplay", False)
         player.settings['autoplay'] = check
+        await MongoDBHandler.update_settings(ctx.guild.id, {"$set": {"autoplay": check}})
         await send_localized_message(ctx, "player.controls.autoplay", await LangHandler.get_lang(ctx.guild.id, "common.status.enabled" if check else "common.status.disabled"))
 
         if not player.is_playing:
             await player.do_next()
+        elif check and player.queue.is_empty:
+            player.bot.loop.create_task(player._prebuffer_upcoming(player.current))
         
         if player.is_ipc_connected:
             await player.send_ws({"op": "toggleAutoplay", "status": check})

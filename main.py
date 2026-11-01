@@ -30,6 +30,7 @@ import logging
 import function as func
 
 from discord.ext import commands
+from aiohttp import web
 from logging.handlers import TimedRotatingFileHandler
 from voicelink import Config, LangHandler, MongoDBHandler, IPCClient, VoicelinkException
 from voicelink.utils import dispatch_message
@@ -106,7 +107,18 @@ class Vocard(commands.Bot):
         await self.process_commands(message)
 
     async def setup_hook(self) -> None:
-        # Connecting to MongoDB
+        # Optional lightweight 24/7 Keep-Alive HTTP endpoint for cloud hosting (Render, Koyeb, HuggingFace)
+        if os.getenv("PORT") or os.getenv("KEEP_ALIVE", "").lower() in ("1", "true", "yes"):
+            port = int(os.getenv("PORT", 8080))
+            app = web.Application()
+            app.router.add_get("/", lambda req: web.json_response({"status": "ok", "bot": str(self.user or "Vocard")}))
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            func.logger.info(f"Keep-Alive HTTP server started on port {port}")
+
+        # Connecting to MongoDB (or local_db.json fallback)
         await MongoDBHandler.init(bot_config.mongodb_url, bot_config.mongodb_name)
 
         # Set translator
@@ -202,7 +214,8 @@ async def get_prefix(bot: commands.Bot, message: discord.Message) -> str:
     return prefix if prefix is not None else ""
 
 # Loading settings and logger
-bot_config = Config(func.open_json("settings.json"))
+_raw_settings = func.open_json("settings.json") or func.open_json("settings Example.json")
+bot_config = Config(_raw_settings)
 Lang_handler = LangHandler.init()
 
 LOG_SETTINGS = bot_config.logging

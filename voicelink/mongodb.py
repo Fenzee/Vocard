@@ -22,6 +22,8 @@ SOFTWARE.
 """
 
 import copy
+import json
+import os
 import time
 import asyncio
 import logging
@@ -56,8 +58,8 @@ UpdateOperationType = Literal["$set", "$unset", "$inc", "$push", "$pull"]
 
 class MongoDBHandler:
     """
-    Handles MongoDB operations with connection pooling and caching.
-    Implements a thread-safe singleton pattern for database connections.
+    Handles MongoDB operations with connection pooling, caching, and automatic
+    local JSON fallback when MongoDB URI is set to 'local' or omitted.
     """
     
     # Static instance variables
@@ -66,6 +68,8 @@ class MongoDBHandler:
     _settings_db: Optional[AsyncIOMotorCollection] = None
     _users_db: Optional[AsyncIOMotorCollection] = None
     _lock: asyncio.Lock = asyncio.Lock()
+    _local_mode: bool = False
+    _local_file: str = str(Config.WORKING_DIR / "local_db.json")
 
     # Cache with TTL (Time To Live in seconds)
     _CACHE_TTL: int = 300  # 5 minutes
@@ -92,21 +96,40 @@ class MongoDBHandler:
     }
 
     @classmethod
+    def _load_local(cls) -> None:
+        if not os.path.exists(cls._local_file):
+            return
+        try:
+            with open(cls._local_file, "r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+            cls._settings_buffer = {int(k): v for k, v in raw.get("settings", {}).items()}
+            cls._users_buffer = {int(k): v for k, v in raw.get("users", {}).items()}
+        except Exception as e:
+            logger.warning("Failed to load local_db.json: %s", e)
+
+    @classmethod
+    def _save_local(cls) -> None:
+        try:
+            data = {
+                "settings": {str(k): v for k, v in cls._settings_buffer.items()},
+                "users": {str(k): v for k, v in cls._users_buffer.items()},
+            }
+            with open(cls._local_file, "w", encoding="utf-8") as fp:
+                json.dump(data, fp, indent=2)
+        except Exception as e:
+            logger.warning("Failed to save local_db.json: %s", e)
+
+    @classmethod
     async def init(cls, uri: str, db_name: str) -> None:
         """
         Initialize the MongoDB connection with connection pooling and error handling.
-        
-        Args:
-            uri (str): MongoDB connection URI
-            db_name (str): Name of the database to use
-            
-        Raises:
-            ConnectionError: If unable to connect to MongoDB
-            Exception: For other initialization errors
+        Falls back to local JSON storage if URI is 'local' or placeholder.
         """
-        if not uri or not db_name:
-            logger.error("MongoDB initialization failed: URI or database name is missing.")
-            raise ValueError("Both URI and database name must be provided.")
+        if not uri or uri in ("local", "YOUR_MONGODB_URL") or not db_name or db_name == "YOUR_MONGODB_DB_NAME":
+            cls._local_mode = True
+            cls._load_local()
+            logger.info("Using local JSON storage (local_db.json) instead of MongoDB.")
+            return
 
         async with cls._lock:
             if cls._client is not None:
@@ -135,14 +158,13 @@ class MongoDBHandler:
                 logger.info("MongoDB databases initialized: %s", db_name)
 
             except Exception as e:
-                logger.error("MongoDB initialization failed: %s", str(e), exc_info=True)
-
+                logger.warning("MongoDB connection failed (%s). Falling back to local_db.json!", str(e))
                 cls._client = None
                 cls._db = None
                 cls._settings_db = None
                 cls._users_db = None
-
-                raise ConnectionError(f"Failed to initialize MongoDB: {str(e)}")
+                cls._local_mode = True
+                cls._load_local()
                 
     @classmethod
     async def cleanup_cache(cls) -> None:
@@ -150,6 +172,9 @@ class MongoDBHandler:
         Cleanup expired cache entries to prevent memory leaks.
         Should be called periodically or when cache size exceeds _MAX_CACHE_SIZE.
         """
+        if cls._local_mode:
+            return
+
         current_time = time.time()
         logger.info("Starting cache cleanup at timestamp: %.2f", current_time)
 
@@ -182,25 +207,13 @@ class MongoDBHandler:
     @classmethod
     async def _update_db(
         cls,
-        db: AsyncIOMotorCollection,
+        db: Optional[AsyncIOMotorCollection],
         cache: Dict[str, Any],
         filter_: Dict[str, Any],
         data: Dict[UpdateOperationType, Dict[str, Any]],
     ) -> bool:
         """
         Update database and cache atomically with error handling and validation.
-        
-        Args:
-            db: MongoDB collection to update
-            cache: Cache dictionary to update
-            filter_: MongoDB filter for the update
-            data: Update operations to perform
-            
-        Returns:
-            bool: True if update was successful, False otherwise
-            
-        Raises:
-            ValueError: If invalid update operation is provided
         """
         async with cls._lock:
             try:
@@ -251,6 +264,12 @@ class MongoDBHandler:
                         except Exception as e:
                             raise ValueError(f"Error updating {key}: {str(e)}")
 
+                if cls._local_mode or db is None:
+                    if '_id' in filter_:
+                        cls._last_access[filter_['_id']] = time.time()
+                    cls._save_local()
+                    return True
+
                 # Then update database
                 result = await db.update_one(filter_, data)
                 
@@ -261,8 +280,7 @@ class MongoDBHandler:
                 return result.modified_count > 0
 
             except Exception as e:
-                # Rollback cache if database update fails
-                if '_id' in filter_:
+                if not cls._local_mode and '_id' in filter_:
                     cls._settings_buffer.pop(filter_['_id'], None)
                     cls._users_buffer.pop(filter_['_id'], None)
                 raise Exception(f"Update failed: {str(e)}")
@@ -274,12 +292,6 @@ class MongoDBHandler:
     ) -> Dict[str, Any]:
         """
         Retrieve settings for a guild with caching.
-        
-        Args:
-            guild_id: The Discord guild ID
-            
-        Returns:
-            Dict containing guild settings or empty dict if not found
         """
         try:
             if guild_id not in cls._settings_buffer:
@@ -300,24 +312,24 @@ class MongoDBHandler:
     ) -> Dict[str, Any]:
         """
         Retrieve settings for a guild with caching.
-        
-        Args:
-            guild_id: The Discord guild ID
-            force_refresh: If True, bypass cache and fetch fresh data
-            
-        Returns:
-            Dict containing guild settings
-            
-        Raises:
-            ConnectionError: If database operation fails
         """
         try:
             async with cls._lock:
+                if cls._local_mode or cls._settings_db is None:
+                    if guild_id not in cls._settings_buffer:
+                        cls._settings_buffer[guild_id] = {"_id": guild_id, "24/7": True, "autoplay": True}
+                        cls._save_local()
+                    elif "autoplay" not in cls._settings_buffer[guild_id]:
+                        cls._settings_buffer[guild_id]["autoplay"] = True
+                    cls._last_access[guild_id] = time.time()
+                    buffer = cls._settings_buffer[guild_id]
+                    return copy.deepcopy(buffer) if deep_copy else buffer
+
                 # Check if we need fresh data
                 if force_refresh or guild_id not in cls._settings_buffer:
                     settings = await cls._settings_db.find_one({"_id": guild_id})
                     if not settings:
-                        settings = {"_id": guild_id}
+                        settings = {"_id": guild_id, "24/7": True}
                         try:
                             await cls._settings_db.insert_one(settings)
                         except Exception as e:
@@ -342,18 +354,6 @@ class MongoDBHandler:
     ) -> bool:
         """
         Update settings for a guild.
-        
-        Args:
-            guild_id: The Discord guild ID
-            data: Update operations to perform
-            upsert: If True, create document if it doesn't exist
-            
-        Returns:
-            bool: True if update was successful
-            
-        Raises:
-            ValueError: If invalid update data is provided
-            ConnectionError: If database operation fails
         """
         try:
             settings = await cls.get_settings(guild_id, deep_copy=False)
@@ -365,10 +365,12 @@ class MongoDBHandler:
             )
             
             if not result and upsert:
-                # Try to insert if update failed and upsert is True
                 settings = {"_id": guild_id, **data.get("$set", {})}
-                await cls._settings_db.insert_one(settings)
+                if not cls._local_mode and cls._settings_db is not None:
+                    await cls._settings_db.insert_one(settings)
                 cls._settings_buffer[guild_id] = settings
+                if cls._local_mode:
+                    cls._save_local()
                 return True
                 
             return result
@@ -387,24 +389,17 @@ class MongoDBHandler:
     ) -> Dict[str, Any]:
         """
         Retrieve user data with caching and type-specific data.
-        
-        Args:
-            user_id: The Discord user ID
-            d_type: Specific data type to retrieve
-            need_copy: If True, return a deep copy of the data
-            force_refresh: If True, bypass cache and fetch fresh data
-            
-        Returns:
-            Dict containing user data
-            
-        Raises:
-            ConnectionError: If database operation fails
-            ValueError: If invalid d_type is provided
         """
         try:
             async with cls._lock:
-                # Check if we need fresh data
-                if force_refresh or user_id not in cls._users_buffer:
+                if cls._local_mode or cls._users_db is None:
+                    if user_id not in cls._users_buffer:
+                        user = {**copy.deepcopy(cls._user_base), "_id": user_id}
+                        user["playlist"]["200"]["name"] = Config().get_playlist_config()[2]
+                        cls._users_buffer[user_id] = user
+                        cls._save_local()
+                    cls._last_access[user_id] = time.time()
+                elif force_refresh or user_id not in cls._users_buffer:
                     user = await cls._users_db.find_one({"_id": user_id})
                     if not user:
                         user = {**copy.deepcopy(cls._user_base), "_id": user_id}
@@ -439,18 +434,6 @@ class MongoDBHandler:
     ) -> bool:
         """
         Update user data.
-        
-        Args:
-            user_id: The Discord user ID
-            data: Update operations to perform
-            upsert: If True, create user if doesn't exist
-            
-        Returns:
-            bool: True if update was successful
-            
-        Raises:
-            ValueError: If invalid update data is provided
-            ConnectionError: If database operation fails
         """
         try:
             user = await cls.get_user(user_id, need_copy=False)
@@ -462,10 +445,12 @@ class MongoDBHandler:
             )
             
             if not result and upsert:
-                # Try to insert if update failed and upsert is True
                 user_data = {"_id": user_id, **data.get("$set", {})}
-                await cls._users_db.insert_one(user_data)
+                if not cls._local_mode and cls._users_db is not None:
+                    await cls._users_db.insert_one(user_data)
                 cls._users_buffer[user_id] = user_data
+                if cls._local_mode:
+                    cls._save_local()
                 return True
                 
             return result
@@ -477,18 +462,16 @@ class MongoDBHandler:
     async def delete_user(cls, user_id: int) -> bool:
         """
         Delete a user's data completely.
-        
-        Args:
-            user_id: The Discord user ID
-            
-        Returns:
-            bool: True if deletion was successful
-            
-        Raises:
-            ConnectionError: If database operation fails
         """
         try:
             async with cls._lock:
+                if cls._local_mode or cls._users_db is None:
+                    existed = cls._users_buffer.pop(user_id, None) is not None
+                    cls._last_access.pop(user_id, None)
+                    if existed:
+                        cls._save_local()
+                    return existed
+
                 result = await cls._users_db.delete_one({"_id": user_id})
                 if result.deleted_count > 0:
                     cls._users_buffer.pop(user_id, None)
@@ -509,19 +492,14 @@ class MongoDBHandler:
     ) -> List[Dict[str, Any]]:
         """
         Retrieve multiple users matching specific criteria.
-        
-        Args:
-            criteria: MongoDB query criteria
-            limit: Maximum number of users to return
-            skip: Number of matching users to skip
-            
-        Returns:
-            List of matching user data
-            
-        Raises:
-            ConnectionError: If database operation fails
         """
         try:
+            if cls._local_mode or cls._users_db is None:
+                users = list(cls._users_buffer.values())[skip:]
+                if limit:
+                    users = users[:limit]
+                return copy.deepcopy(users)
+
             cursor = cls._users_db.find(criteria).skip(skip)
             if limit:
                 cursor = cursor.limit(limit)

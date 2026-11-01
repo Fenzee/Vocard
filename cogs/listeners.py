@@ -131,12 +131,15 @@ class Listeners(commands.Cog):
             func.logger.error("Failed to remove session file: %s", Config.LAST_SESSION_FILE_DIR, exc_info=del_error)
 
     @commands.Cog.listener()
-    async def on_voicelink_track_end(self, player: voicelink.Player, track, _):
+    async def on_voicelink_track_end(self, player: voicelink.Player, track, reason: str):
+        if getattr(player, "_tearing_down", False) or reason == "cleanup":
+            return
         await player.do_next()
 
     @commands.Cog.listener()
     async def on_voicelink_track_stuck(self, player: voicelink.Player, track, _):
-        await asyncio.sleep(10)
+        await asyncio.sleep(0.5)
+        await player.stop()
         await player.do_next()
 
     @commands.Cog.listener()
@@ -149,6 +152,19 @@ class Listeners(commands.Cog):
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        if member.id == self.bot.user.id:
+            if before.channel and not after.channel:
+                player: voicelink.Player = member.guild.voice_client
+                if player and not getattr(player, "_tearing_down", False):
+                    player.channel = before.channel
+                    await player.teardown()
+                else:
+                    try:
+                        await before.channel.edit(status=None)
+                    except Exception:
+                        pass
+            return
+
         if member.bot:
             return
         

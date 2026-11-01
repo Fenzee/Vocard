@@ -134,7 +134,12 @@ class PlayerPlaceholder:
         if not self.player or not self.player.current:
             return "https://i.imgur.com/dIFBwU7.png"
         
-        return self.player.current.thumbnail or "https://cdn.discordapp.com/attachments/674788144931012638/823086668445384704/eq-dribbble.gif"
+        cur = self.player.current
+        if cur.thumbnail:
+            return cur.thumbnail
+        if cur.identifier and len(cur.identifier) == 11 and " " not in cur.identifier:
+            return f"https://img.youtube.com/vi/{cur.identifier}/hqdefault.jpg"
+        return "https://i.imgur.com/dIFBwU7.png"
 
     def queue_length(self) -> str:
         return str(self.player.queue.count) if self.player else "0"

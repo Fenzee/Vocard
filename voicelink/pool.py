@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 import aiohttp
 import logging
 
@@ -350,6 +351,47 @@ class Node:
         data = await self.send(RequestMethod.GET, f"decodetrack?encodedTrack={identifier}")
         return Track(track_id=identifier, info=data, requester=requester)
 
+    async def _loadtracks_cached(self, identifier: str) -> dict[str, Any]:
+        """Loads tracks from the node with an in-memory TTL cache for instant repeat responses."""
+        cache_key = f"{self._identifier}:{identifier.lower().strip()}"
+        now = time.monotonic()
+        cached = NodePool._search_cache.get(cache_key)
+        if cached and (now - cached[0]) < 1800:
+            return cached[1]
+
+        res = await self.send(RequestMethod.GET, f"loadtracks?identifier={quote(identifier)}")
+        if res and res.get("loadType") in ("search", "track", "playlist", "recommendations") and res.get("data"):
+            if len(NodePool._search_cache) > 500:
+                oldest_key = next(iter(NodePool._search_cache))
+                NodePool._search_cache.pop(oldest_key, None)
+            NodePool._search_cache[cache_key] = (now, res)
+        return res
+
+    async def resolve_external_track(self, track: Track) -> Track:
+        """Resolves external stub tracks (Spotify, Apple Music, Deezer) to a playable audio stream."""
+        if track.info.get("_stream_resolved"):
+            return track
+
+        search_query = f"{track.author} - {track.title}".strip(" -")
+        for prefix in ("ytmsearch", "ytsearch", "scsearch"):
+            try:
+                res = await self._loadtracks_cached(f"{prefix}:{search_query}")
+                if res.get("loadType") == "search" and res.get("data"):
+                    matched = res["data"][0]
+                    matched_info = matched.get("info", {})
+                    matched_id = matched_info.get("identifier")
+                    track._track_id = matched["encoded"]
+                    if not track.thumbnail:
+                        track.thumbnail = matched_info.get("artworkUrl") or (f"https://img.youtube.com/vi/{matched_id}/hqdefault.jpg" if matched_id else None)
+                        track.info["artworkUrl"] = track.thumbnail
+                    if matched_id:
+                        track.info["_yt_id"] = matched_id
+                    track.info["_stream_resolved"] = True
+                    return track
+            except Exception:
+                continue
+        return track
+
     async def get_tracks(
         self,
         query: str,
@@ -366,12 +408,19 @@ class Node:
         if not search_type:
             search_type = Config().search_platform
             
-        if not URL_REGEX.match(query) and ':' not in query:
+        is_plain_search = not URL_REGEX.match(query) and ':' not in query
+        raw_query = query
+        if is_plain_search:
             query = f"{search_type}:{query}"
 
-        response: dict[str, Any] = await self.send(RequestMethod.GET, f"loadtracks?identifier={quote(query)}")
+        response: dict[str, Any] = await self._loadtracks_cached(query)
         data = response.get("data")
         load_type = response.get("loadType")
+
+        if load_type in ("empty", "error", None) and is_plain_search and str(search_type) != "ytmsearch":
+            response = await self._loadtracks_cached(f"ytmsearch:{raw_query}")
+            data = response.get("data")
+            load_type = response.get("loadType")
 
         if not load_type:
             raise TrackLoadError("There was an error while trying to load this track.")
@@ -386,10 +435,13 @@ class Node:
             return Playlist(playlist_info=data["info"], tracks=data["tracks"], requester=requester)
 
         elif load_type == "search":
-            return [Track(track_id=track["encoded"], info=track["info"], requester=requester) for track in data]
+            return [Track(track_id=track["encoded"], info=dict(track["info"]), requester=requester) for track in data]
 
         elif load_type == "track":
-            return [Track(track_id=data["encoded"], info=data["info"], requester=requester)]
+            track_obj = Track(track_id=data["encoded"], info=dict(data["info"]), requester=requester)
+            if track_obj.source in ("spotify", "applemusic", "deezer"):
+                await self.resolve_external_track(track_obj)
+            return [track_obj]
     
     async def update_refresh_yt_access_token(self, token: YTToken) -> dict:
         if not self._available:
@@ -411,6 +463,7 @@ class NodePool:
     """
 
     _nodes: Dict[str, Node] = {}
+    _search_cache: Dict[str, tuple[float, dict]] = {}
 
     def __repr__(self):
         return f"<Voicelink.NodePool node_count={self.node_count}>"
@@ -458,18 +511,26 @@ class NodePool:
            If no identifier is provided, it will choose a node at random.
         """
 
-        available_nodes = { node
-            for _, node in cls._nodes.items() if node.is_connected
-        }
+        available_nodes = [
+            node for _, node in cls._nodes.items() if node.is_connected
+        ]
 
         if identifier:
-            available_nodes = { node for node in available_nodes if node._identifier == identifier }
+            available_nodes = [node for node in available_nodes if node._identifier == identifier]
 
         if not available_nodes:
             raise NoNodesAvailable("There are no nodes available.")
 
-        nodes = {node: len(node.players.keys()) for node in available_nodes}
-        return min(nodes, key=nodes.get)
+        # Prefer the highest-priority connected node (first in settings.json, e.g. KASAWA_FAST)
+        # unless its CPU load or global active player count is excessively high.
+        for node in available_nodes:
+            stats = node._stats
+            if stats:
+                if (stats.cpu_process_load and stats.cpu_process_load > 0.85) or (stats.players_active and stats.players_active > 250):
+                    continue
+            return node
+
+        return available_nodes[0]
 
     @classmethod
     async def create_node(

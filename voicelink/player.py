@@ -58,6 +58,8 @@ from .mongodb import MongoDBHandler
 from .language import LangHandler
 from .views import InteractiveController
 from .utils import format_ms, dispatch_message
+from .universal_lyrics import prefetch_lyrics
+from .smart_autoplay import fetch_smart_recommendations
 
 if TYPE_CHECKING:
     from .ipc import IPCClient
@@ -79,9 +81,6 @@ async def connect_channel(ctx: Union[commands.Context, Interaction], channel: Vo
             ctx.bot if isinstance(ctx, commands.Context) else ctx.client,
             channel, ctx, settings
         ))
-
-    if player.volume != 100:
-        await player.set_volume(player.volume)
 
     if player.is_ipc_connected:
         await player.send_ws({"op": "createPlayer", "memberIds": [str(member.id) for member in channel.members]})
@@ -354,8 +353,14 @@ class Player(VoiceProtocol):
             "sessionId": state['sessionId'],
             "channelId": str(self.channel.id),
         }
-        
+        if getattr(self, "_last_dispatched_voice", None) == data:
+            self._voice_dispatched = True
+            return
+
+        self._last_dispatched_voice = data
         await self.send(method=RequestMethod.PATCH, data={"voice": data})
+        self._voice_dispatched = True
+        self._voice_dispatched_at = time.monotonic()
         self._logger.debug(f"Player in {self.guild.name}({self.guild.id}) dispatched voice update to {state['event']['endpoint']} with data {data}")
 
     async def on_voice_server_update(self, data: dict):
@@ -374,10 +379,10 @@ class Player(VoiceProtocol):
 
         self.channel = self.guild.get_channel(int(channel_id))
 
-        if not data.get("token"):
+        if "event" not in self._voice_state:
             return
 
-        await self._dispatch_voice_update({**self._voice_state, "event": data})
+        await self._dispatch_voice_update(self._voice_state)
 
     async def _dispatch_event(self, data: dict):
         """Dispatches an event based on the type of event data received."""
@@ -398,16 +403,47 @@ class Player(VoiceProtocol):
 
         self._logger.debug(f"Player in {self.guild.name}({self.guild.id}) dispatched event {event_type}.")
 
+    async def _prebuffer_upcoming(self, current_track: Optional[Track] = None) -> None:
+        """Background task to pre-warm lyrics and pre-queue smart autoplay after initial audio buffer stabilizes."""
+        try:
+            # Let the first 2 seconds of audio stream buffer cleanly without any competing network I/O
+            await asyncio.sleep(2.0)
+            if current_track:
+                prefetch_lyrics(current_track.title, current_track.author)
+
+            # Wait until 6s into playback before querying Lavalink for upcoming/autoplay tracks
+            await asyncio.sleep(4.0)
+            if not self.is_playing:
+                return
+
+            upcoming = self.queue.tracks()
+            if upcoming:
+                next_t = upcoming[0]
+                if next_t.source in ("spotify", "applemusic", "deezer") and not next_t.info.get("_stream_resolved"):
+                    await self._node.resolve_external_track(next_t)
+                prefetch_lyrics(next_t.title, next_t.author)
+            elif self.autoplay and not getattr(self, "_prebuffering_autoplay", False):
+                self._prebuffering_autoplay = True
+                try:
+                    if await self.get_recommendations(track=current_track):
+                        new_upcoming = self.queue.tracks()
+                        if new_upcoming:
+                            prefetch_lyrics(new_upcoming[0].title, new_upcoming[0].author)
+                finally:
+                    self._prebuffering_autoplay = False
+        except Exception:
+            pass
+
     async def do_next(self):
-        """Processes the next track in the queue."""
-        if self._current or self.is_playing or not self.channel:
+        """Processes the next track in the queue with zero-latency background updates."""
+        if getattr(self, "_tearing_down", False) or self._current or self.is_playing or not self.channel:
             return
         
         if self._paused:
             self._paused = False
 
         if self._track_is_stuck:
-            await asyncio.sleep(10)
+            await asyncio.sleep(0.3)
             self._track_is_stuck = False
 
         if not self.guild.me.voice:
@@ -432,7 +468,7 @@ class Player(VoiceProtocol):
                 await self.play(track, start=track.position)
             except Exception as e:
                 self._logger.error(f"Something went wrong while playing music in {self.guild.name}({self.guild.id})", exc_info=e)
-                await asyncio.sleep(5)
+                await asyncio.sleep(0.5)
                 return await self.do_next()
 
             if not track.requester.bot:
@@ -440,8 +476,16 @@ class Player(VoiceProtocol):
                     "$push": {"history": {"$each": [track.track_id], "$slice": -25}}
                 }))
 
-        await self.invoke_controller()
-        await self.update_voice_status()
+            if prev_prebuf := getattr(self, "_prebuffer_task", None):
+                if not prev_prebuf.done():
+                    prev_prebuf.cancel()
+            self._prebuffer_task = self._bot.loop.create_task(self._prebuffer_upcoming(track))
+
+        self._bot.loop.create_task(self.invoke_controller())
+        if prev_vs := getattr(self, "_voice_status_task", None):
+            if not prev_vs.done():
+                prev_vs.cancel()
+        self._voice_status_task = self._bot.loop.create_task(self.update_voice_status())
 
         if self.is_ipc_connected:
             await self.send_ws({
@@ -506,6 +550,33 @@ class Player(VoiceProtocol):
     
     async def teardown(self):
         """Cleans up the player and associated resources."""
+        if getattr(self, "_tearing_down", False):
+            return
+        self._tearing_down = True
+        self._current = None
+
+        for task_attr in ("_prebuffer_task", "_voice_status_task"):
+            t = getattr(self, task_attr, None)
+            if t and not t.done():
+                t.cancel()
+        self._cancel_inactive_cleanup_timer()
+
+        target_channel = self.channel
+
+        try:
+            await self.update_voice_status(remove_status=True, channel=target_channel)
+        except Exception:
+            pass
+
+        try:
+            if self.controller:
+                if self.controller.id == self.settings.get("music_request_channel", {}).get("controller_msg_id"):
+                    await self.controller.edit(embed=self.build_embed(), view=None)
+                else: 
+                    await self.controller.delete()
+        except Exception:
+            pass
+
         try:
             await MongoDBHandler.update_settings(self.guild.id, {"$set": {
                 "last_active": (timeNow := round(time.time())), 
@@ -514,23 +585,12 @@ class Player(VoiceProtocol):
             
             if self.is_ipc_connected:
                 await self.send_ws({"op": "playerClose"})
-        except:
-            pass
-
-        try:
-            await self.update_voice_status(remove_status=True)
-            self._cancel_inactive_cleanup_timer()
-            if self.controller:
-                if self.controller.id == self.settings.get("music_request_channel", {}).get("controller_msg_id"):
-                    await self.controller.edit(embed=self.build_embed(), view=None)
-                else: 
-                    await self.controller.delete()
-        except:
+        except Exception:
             pass
 
         try:
             await self.destroy()
-        except:
+        except Exception:
             pass
 
     async def get_tracks(
@@ -547,8 +607,28 @@ class Player(VoiceProtocol):
         """
         if not search_type:
             search_type = Config().search_platform
-            
-        return await self._node.get_tracks(query, requester=requester, search_type=search_type)
+
+        try:
+            tracks = await self._node.get_tracks(query, requester=requester, search_type=search_type)
+            if tracks:
+                return tracks
+        except Exception as e:
+            self._logger.warning(f"Node [{self._node._identifier}] failed to load tracks ({e}), trying backup nodes...")
+
+        for identifier, node in NodePool._nodes.items():
+            if node == self._node or not node.is_connected:
+                continue
+            try:
+                tracks = await node.get_tracks(query, requester=requester, search_type=search_type)
+                if tracks:
+                    if not self._node.is_connected:
+                        self._logger.info(f"Switched player in {self.guild.name} to backup node [{identifier}]")
+                        await self.change_node(identifier)
+                    return tracks
+            except Exception:
+                continue
+
+        return None
 
     async def connect(self, *, timeout: float, reconnect: bool, self_deaf: bool = True, self_mute: bool = False):
         """Connects the player to a voice channel."""
@@ -600,9 +680,23 @@ class Player(VoiceProtocol):
         if not self._node:
             return track
 
+        if track.source in ("spotify", "applemusic", "deezer") and not track.info.get("_stream_resolved"):
+            await self._node.resolve_external_track(track)
+
+        # Ensure Discord voice server handshake has been dispatched and settled so the first second never stutters
+        for _ in range(35):
+            if getattr(self, "_voice_dispatched", False):
+                break
+            await asyncio.sleep(0.04)
+
+        dispatched_at = getattr(self, "_voice_dispatched_at", 0.0)
+        if dispatched_at and (elapsed := time.monotonic() - dispatched_at) < 0.28:
+            await asyncio.sleep(0.28 - elapsed)
+
         data = {
             "encodedTrack": track.track_id,
-            "position": str(start or 0)
+            "position": str(start or 0),
+            "volume": self._volume,
         }
 
         if end or track.end_time:
@@ -682,7 +776,9 @@ class Player(VoiceProtocol):
                     await self.send_ws({"op": "addTrack", "tracks": [track.track_id for track in tracks], "position": -1 if is_list else position}, tracks[0].requester)
 
                 self._logger.debug(f"Player in {self.guild.name}({self.guild.id}) has been added {len(tracks)} tracks into the queue.")
-                return len(tracks) if is_list else position
+        if tracks:
+            return len(tracks) if is_list else position
+        return 0
     
     async def remove_track(self, index: int, index2: int = None, remove_target: Member = None, requester: Member = None) -> Dict[int, Track]:
         """Removes one or more tracks from the queue."""
@@ -881,39 +977,59 @@ class Player(VoiceProtocol):
                 await self.set_pause(True)
     
     async def get_recommendations(self, *, track: Optional[Track] = None) -> bool:
-        """Fetches and adds recommended tracks based on the provided track or recent history."""
+        """Fetches and adds smart era-aware recommended tracks based on the current/recent track."""
         if not track:
-            try:
-                track = choice(self.queue.history(incTrack=True)[-5:])
-            except IndexError:
-                return False
+            history = self.queue.history(incTrack=True)
+            if history:
+                track = choice(history[-5:])
+            elif self.current:
+                track = self.current
 
-        tracks = await track.get_recommendations(self._node)
+        tracks = await fetch_smart_recommendations(self, seed_track=track, count=1)
+        if not tracks and track:
+            tracks = await track.get_recommendations(self._node)
+
         if tracks:
-            await self.add_track(tracks, duplicate=False)
-            
-            self._logger.debug(f"Player in {self.guild.name}({self.guild.id}) has been requested recommendations.")
+            await self.add_track(tracks[:2], duplicate=False)
+            prefetch_lyrics(tracks[0].title, tracks[0].author)
+            self._logger.debug(f"Player in {self.guild.name}({self.guild.id}) has been requested smart recommendations.")
             return True
         return False
     
-    async def update_voice_status(self, remove_status: bool = False) -> None:
-        """Updates the voice status of the channel based on the specified template."""
+    async def update_voice_status(self, remove_status: bool = False, channel: Optional[VoiceChannel] = None) -> None:
+        """Updates or clears the voice status of the channel."""
+        target_channel = channel or self.channel
+        if not target_channel or target_channel.type != ChannelType.voice:
+            return
+
+        if remove_status:
+            try:
+                await target_channel.edit(status=None)
+            except Exception:
+                try:
+                    await target_channel.edit(status="")
+                except Exception as e:
+                    self._logger.debug(f"Could not clear voice status on {target_channel.id}: {e}")
+            return
+
+        if getattr(self, "_tearing_down", False):
+            return
+
         template = self.settings.get("stage_announce_template", Config().voice_status_template)
-        if not template or not self.channel:
+        if not template:
             return
         
         try:
             rv = {key: func() if callable(func) else func for key, func in self._ph.variables.items()}
-            status = None if remove_status else self._ph.replace(text=template, variables=rv)
-            # if self.channel.status != status:
-            if self.channel.type == ChannelType.voice:
-                await self.channel.edit(status=status)
+            status = self._ph.replace(text=template, variables=rv)
+            if not getattr(self, "_tearing_down", False):
+                await target_channel.edit(status=status)
 
         except Exception as e:
             self._logger.error(
-                f"Failed to update voice status in channel '{self.channel.name}' "
-                f"({self.channel.id}) for guild '{self.channel.guild}' "
-                f"({self.channel.guild.id})", 
+                f"Failed to update voice status in channel '{target_channel.name}' "
+                f"({target_channel.id}) for guild '{target_channel.guild}' "
+                f"({target_channel.guild.id})", 
                 exc_info=e
             )
 

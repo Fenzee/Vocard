@@ -1,0 +1,49 @@
+name: 24/7 Discord Music Bot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  schedule:
+    # Otomatis me-refresh sesi sebelum batas 6 jam GitHub Actions habis
+    - cron: '30 */5 * * *'
+
+# Memastikan hanya ada 1 instance bot yang aktif (tidak dobel)
+concurrency:
+  group: nexalis-music-bot-24-7
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run NexalisMusic Bot (24/7 Cycle)
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          # Jalankan bot selama 5 jam 40 menit lalu keluar dengan bersih agar jadwal berikutnya mengambil alih
+          timeout --preserve-status 340m python -u main.py || true
+
+      - name: Auto-Retrigger Next 24/7 Cycle
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "24/7 Discord Music Bot" --ref ${{ github.ref_name }} || true
+

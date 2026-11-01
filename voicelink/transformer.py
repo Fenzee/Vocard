@@ -165,7 +165,7 @@ def decode_probe_info(reader: DataReader) -> Mapping[str, Any]:
     return {'probe_info': probe_info}
 
 def decode_lavasrc_fields(reader: DataReader) -> Mapping[str, Any]:
-    if reader.remaining <= 8:
+    if reader.remaining <= 14:
         return {}
 
     album_name = reader.read_nullable_utf()
@@ -282,9 +282,16 @@ def decode(
     source_specific_fields = {}
 
     if source in decoders:
-        source_specific_fields.update(decoders[source](reader))
+        try:
+            source_specific_fields.update(decoders[source](reader))
+        except Exception:
+            pass
 
-    position = reader.read_long()
+    if reader.remaining >= 8:
+        reader._buf.seek(reader._buf.getbuffer().nbytes - 8)
+        position = reader.read_long()
+    else:
+        position = 0
 
     return {
         'title': title,

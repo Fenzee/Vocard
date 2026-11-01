@@ -307,10 +307,13 @@ class AutoPlay(ControlButton):
 
         check = not self.player.settings.get("autoplay", False)
         self.player.settings['autoplay'] = check
+        await MongoDBHandler.update_settings(interaction.guild_id, {"$set": {"autoplay": check}})
         await self.send(interaction, 'player.controls.autoplay', await LangHandler.get_lang(interaction.guild_id, 'common.status.enabled' if check else "common.status.disabled"))
 
         if not self.player.is_playing:
             await self.player.do_next()
+        elif check and self.player.queue.is_empty:
+            self.player.bot.loop.create_task(self.player._prebuffer_upcoming(self.player.current))
 
 class Shuffle(ControlButton):
     def __init__(self, **kwargs):
@@ -380,7 +383,7 @@ class Lyrics(ControlButton):
         if not self.player or not self.player.is_playing:
             return await self.send(interaction, "player.errors.noTrackPlaying", ephemeral=True)
         
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         title = self.player.current.title
         artist = self.player.current.author
@@ -391,7 +394,7 @@ class Lyrics(ControlButton):
             if not lyrics:
                 return await self.send(interaction, "lyrics.notFound", ephemeral=True)
 
-            view = LyricsView(name=title, source={_: re.findall(r'.*\n(?:.*\n){,22}', v or "") for _, v in lyrics.items()}, author=interaction.user)
+            view = LyricsView(name=title, source={_: re.findall(r'.*\n(?:.*\n){,22}', (v or "") + "\n") for _, v in lyrics.items()}, author=interaction.user)
             view.response = await self.send_embed(interaction, await view.build_embed(), view=view, ephemeral=True)
 
 class Tracks(ControlSelect):
@@ -417,7 +420,7 @@ class Tracks(ControlSelect):
         if not self.player.is_privileged(interaction.user):
             return await self.send(interaction, "permissions.missingFunction", ephemeral=True)
         
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         self.player.queue.skipto(int(self.values[0].split(". ")[0]))
         await self.player.stop()
@@ -442,7 +445,7 @@ class Effects(ControlSelect):
         if not self.player.is_privileged(interaction.user):
             return await self.send(interaction, "permissions.missingFunction", ephemeral=True)
         
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         avalibable_filters = voicelink.Filters.get_available_filters()
         if self.values[0] == "None":

@@ -30,4 +30,7 @@ COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/pytho
 COPY . .
 
 # Run the application
+ENV KEEP_ALIVE=true
+ENV PORT=8080
+EXPOSE 8080
 CMD ["python", "-u", "main.py"]

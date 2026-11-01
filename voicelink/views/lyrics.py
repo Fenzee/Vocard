@@ -51,8 +51,9 @@ class LyricsView(PaginationView):
         self.author: discord.Member = author
         self.response: discord.Message = None
         
+        items = source.get("default") or next((v for v in source.values() if v), ["No lyrics available."])
         super().__init__(
-            Pagination[str](source.get("default"), page_size=1),
+            Pagination[str](items, page_size=1),
             author
         )
 

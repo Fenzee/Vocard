@@ -82,6 +82,8 @@ class Track:
         self._search_type: SearchType = search_type
 
         self.thumbnail: str = info.get("artworkUrl")
+        if not self.thumbnail and self.source in ("youtube", "youtubemusic") and self.identifier:
+            self.thumbnail = f"https://img.youtube.com/vi/{self.identifier}/hqdefault.jpg"
         self.emoji: str = Config().get_source_config(self.source, "emoji")
         self.length: float = info.get("length")
         

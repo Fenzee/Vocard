@@ -75,11 +75,16 @@ class Config:
             
         settings = settings or {}
         
-        self.token: str = settings.get("token") or os.getenv("TOKEN")
-        self.client_id: int = int(settings.get("client_id", 0)) or int(os.getenv("CLIENT_ID"))
-        self.genius_token: str = settings.get("genius_token") or os.getenv("GENIUS_TOKEN")
-        self.mongodb_url: str = settings.get("mongodb_url") or os.getenv("MONGODB_URL")
-        self.mongodb_name: str = settings.get("mongodb_name") or os.getenv("MONGODB_NAME")
+        raw_token = os.getenv("TOKEN") or settings.get("token")
+        self.token: str = raw_token if raw_token != "YOUR_BOT_TOKEN" else (os.getenv("TOKEN") or raw_token)
+        raw_client_id = os.getenv("CLIENT_ID") or settings.get("client_id", 0)
+        try:
+            self.client_id: int = int(raw_client_id)
+        except (ValueError, TypeError):
+            self.client_id: int = 0
+        self.genius_token: str = os.getenv("GENIUS_TOKEN") or settings.get("genius_token")
+        self.mongodb_url: str = os.getenv("MONGODB_URL") or settings.get("mongodb_url")
+        self.mongodb_name: str = os.getenv("MONGODB_NAME") or settings.get("mongodb_name")
         
         self.invite_link: str = "https://discord.gg/wRCgB7vBQv"
         self.nodes: Dict[str, Dict[str, Union[str, int, bool]]] = settings.get("nodes", {})

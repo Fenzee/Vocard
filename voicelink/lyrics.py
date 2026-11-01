@@ -231,7 +231,7 @@ class Lyrist(LyricsPlatform):
 
 class Lrclib(LyricsPlatform):
     def __init__(self):
-        self.base_url: str = "https://lrclib.net/api/"
+        self.base_url: str = "https://lrclib.net/api/"                                               
 
     async def get(self, url, params: dict = None) -> list[dict]:
         try:
@@ -368,10 +368,13 @@ class MusixMatch(LyricsPlatform):
 
         return {"default": lyrics_body}
 
+from .universal_lyrics import UniversalLyricsPlatform, get_full_lyrics_data
+
 LYRICS_PLATFORMS: dict[str, Type[LyricsPlatform]] = {
-    "a_zlyrics": A_ZLyrics,
-    "genius": Genius,
-    "lyrist": Lyrist,
-    "lrclib": Lrclib,
-    "musixmatch": MusixMatch
+    "a_zlyrics": UniversalLyricsPlatform,
+    "genius": UniversalLyricsPlatform,
+    "lyrist": UniversalLyricsPlatform,
+    "lrclib": UniversalLyricsPlatform,
+    "musixmatch": UniversalLyricsPlatform,
+    "universal": UniversalLyricsPlatform,
 }

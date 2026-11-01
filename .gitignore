@@ -176,4 +176,5 @@ cython_debug/
 
 # Custom file
 settings.json
+local_db.json
 logs
