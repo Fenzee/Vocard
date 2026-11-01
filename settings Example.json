@@ -207,7 +207,7 @@
             }
         ]
     },
-    "default_voice_status_template": "{{@@track_name@@ != 'None' ?? @@track_source_emoji@@ Now Playing: @@track_name@@ // Waiting for song requests}}",
+    "default_voice_status_template": "",
     "cooldowns": {
         "connect": [2, 30],
         "playlist view": [1, 30]

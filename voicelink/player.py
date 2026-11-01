@@ -1012,26 +1012,14 @@ class Player(VoiceProtocol):
                     self._logger.debug(f"Could not clear voice status on {target_channel.id}: {e}")
             return
 
-        if getattr(self, "_tearing_down", False):
-            return
-
-        template = self.settings.get("stage_announce_template", Config().voice_status_template)
-        if not template:
-            return
-        
-        try:
-            rv = {key: func() if callable(func) else func for key, func in self._ph.variables.items()}
-            status = self._ph.replace(text=template, variables=rv)
-            if not getattr(self, "_tearing_down", False):
-                await target_channel.edit(status=status)
-
-        except Exception as e:
-            self._logger.error(
-                f"Failed to update voice status in channel '{target_channel.name}' "
-                f"({target_channel.id}) for guild '{target_channel.guild}' "
-                f"({target_channel.guild.id})", 
-                exc_info=e
-            )
+        # Voice channel status is DISABLED: the bot never sets "Now Playing" status anymore.
+        # Only clear a leftover status (from older versions) once, if one exists.
+        if getattr(target_channel, "status", None):
+            try:
+                await target_channel.edit(status=None)
+            except Exception as e:
+                self._logger.debug(f"Could not clear leftover voice status on {target_channel.id}: {e}")
+        return
 
     async def send_ws(self, payload, requester: Member = None):
         """Sends a WebSocket payload to the bot's IPC (Inter-Process Communication) system."""
